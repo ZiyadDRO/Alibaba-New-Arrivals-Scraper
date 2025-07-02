@@ -1,0 +1,92 @@
+{% extends "base.html" %}
+
+{% block title %}Product Listings - Alibaba New Arrivals Explorer{% endblock %}
+
+{% block content %}
+<div class="row mb-4">
+    <div class="col-md-12">
+        <h2>New Arrivals</h2>
+        <form method="get" action="{{ url_for("index") }}" class="form-inline">
+            <input type="text" name="query" class="form-control mr-sm-2" placeholder="Search products..." value="{{ query or "" }}">
+            
+            <select name="cluster" class="form-control mr-sm-2">
+                <option value="">All Clusters</option>
+                {% for cluster_id in clusters %}
+                    {% if cluster_id is not none %}
+                    <option value="{{ cluster_id }}" {% if selected_cluster == cluster_id %}selected{% endif %}>
+                        Cluster {{ cluster_id }}
+                    </option>
+                    {% endif %}
+                {% endfor %}
+            </select>
+            <button type="submit" class="btn btn-primary">Search/Filter</button>
+        </form>
+    </div>
+</div>
+
+<div class="row">
+    {% if products %}
+        {% for product in products %}
+        <div class="col-md-4 mb-4">
+            <div class="card h-100">
+                {% if product.image_url %}
+                    <img src="{{ product.image_url }}" class="card-img-top product-image" alt="{{ product.name }}" onerror="this.style.display=\"none\"">
+                {% else %}
+                    <div class="card-img-top product-image-placeholder d-flex align-items-center justify-content-center">
+                        <span>No Image</span>
+                    </div>
+                {% endif %}
+                <div class="card-body d-flex flex-column">
+                    <h5 class="card-title">{{ product.name }}</h5>
+                    <p class="card-text product-price"><strong>Price:</strong> {{ product.price if product.price else "N/A" }}</p>
+                    <p class="card-text"><small class="text-muted">Cluster ID: {{ product.cluster_id if product.cluster_id is not none else "N/A" }}</small></p>
+                    <p class="card-text"><small class="text-muted">Arrival: {{ product.arrival_date.strftime("%Y-%m-%d") if product.arrival_date else "N/A"}}</small></p>
+                    <div class="mt-auto">
+                        <a href="{{ product.product_url }}" class="btn btn-outline-secondary btn-sm" target="_blank">View on Alibaba</a>
+                        <form method="post" action="{{ url_for("add_favorite", product_id=product.id) }}" style="display: inline;">
+                            <button type="submit" class="btn btn-outline-warning btn-sm">Favorite</button>
+                        </form>
+                    </div>
+                </div>
+            </div>
+        </div>
+        {% endfor %}
+    {% else %}
+        <div class="col">
+            <p>No products found. Try adjusting your search or filter, or load/refresh products.</p>
+        </div>
+    {% endif %}
+</div>
+
+{% if pagination %}
+<nav aria-label="Page navigation">
+    <ul class="pagination justify-content-center">
+        {% if pagination.has_prev %}
+            <li class="page-item"><a class="page-link" href="{{ url_for("index", page=pagination.prev_num, query=query, cluster=selected_cluster) }}">Previous</a></li>
+        {% else %}
+            <li class="page-item disabled"><span class="page-link">Previous</span></li>
+        {% endif %}
+
+        {% for page_num in pagination.iter_pages() %}
+            {% if page_num %}
+                {% if pagination.page == page_num %}
+                    <li class="page-item active"><span class="page-link">{{ page_num }}</span></li>
+                {% else %}
+                    <li class="page-item"><a class="page-link" href="{{ url_for("index", page=page_num, query=query, cluster=selected_cluster) }}">{{ page_num }}</a></li>
+                {% endif %}
+            {% else %}
+                <li class="page-item disabled"><span class="page-link">...</span></li>
+            {% endif %}
+        {% endfor %}
+
+        {% if pagination.has_next %}
+            <li class="page-item"><a class="page-link" href="{{ url_for("index", page=pagination.next_num, query=query, cluster=selected_cluster) }}">Next</a></li>
+        {% else %}
+            <li class="page-item disabled"><span class="page-link">Next</span></li>
+        {% endif %}
+    </ul>
+</nav>
+{% endif %}
+
+{% endblock %}
+

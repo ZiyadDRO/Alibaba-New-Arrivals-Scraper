@@ -1,0 +1,499 @@
+#!/usr/bin/env python3
+import asyncio
+import json
+import re
+from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
+from urllib.parse import urlparse
+import time
+
+async def handle_modal_dialogs(page):
+    """Checks for and attempts to close known modal dialogs."""
+    try:
+        modal_mask_selector = "div.baxia-dialog-mask"
+        modal_close_button_selectors = [
+            "div.baxia-dialog-header-close",
+            "button[aria-label='close']", 
+            "button[class*='close']",
+            "span[class*='close']",
+            ".baxia-dialog-close",
+            ".next-dialog-close"
+        ]
+
+        generic_overlay_selector = "div[class*='overlay'][style*='display: block'], div[class*='mask'][style*='display: block']"
+        
+        modal_mask = await page.query_selector(modal_mask_selector)
+        generic_overlay = await page.query_selector(generic_overlay_selector)
+
+        if modal_mask and await modal_mask.is_visible():
+            print("Modal dialog mask detected (baxia-dialog-mask). Attempting to close...")
+        elif generic_overlay and await generic_overlay.is_visible():
+            print("Generic overlay/mask detected. Attempting to close via common selectors...")
+            modal_mask = generic_overlay 
+        else:
+            return False 
+
+        closed = False
+        for btn_selector in modal_close_button_selectors:
+            close_button = await page.query_selector(btn_selector)
+            if close_button and await close_button.is_visible():
+                try:
+                    await close_button.click(timeout=5000)
+                    print(f"Clicked close button with selector: {btn_selector}")
+                    await page.wait_for_timeout(2000) 
+                    if not (modal_mask and await modal_mask.is_visible()): 
+                        print("Modal/Overlay dialog closed successfully.")
+                        closed = True
+                        break
+                    else:
+                        print("Modal/Overlay mask still visible after clicking close button.")
+                except Exception as e:
+                    print(f"Error clicking close button {btn_selector}: {e}")
+            
+        if not closed:
+            print("Could not close modal/overlay by clicking known buttons. Attempting to press Escape key.")
+            await page.keyboard.press("Escape")
+            await page.wait_for_timeout(2000)
+            if not (modal_mask and await modal_mask.is_visible()): 
+                print("Modal/Overlay dialog closed successfully with Escape key.")
+            else:
+                print("Failed to close modal/overlay dialog with Escape key. It might still be present.")
+        return True
+    except Exception as e:
+        print(f"Error during modal handling: {e}")
+    return False
+
+async def scrape_products_from_current_page(page, scroll_delay, max_products_per_category, current_category_name, max_scroll_attempts_no_new_content=3):
+    products_in_category = []
+    print(f"Starting scrape for category: {current_category_name}")
+
+    scroll_attempts_no_new_content = 0
+    total_scroll_limit = 30 
+    scroll_count = 0 
+
+    generic_product_container_selector_for_counting = "div.hugo4-pc-grid-item" # Used to count if new items appear in DOM
+
+    NON_PRODUCT_TITLES = [
+        "safe & easy payments", "money-back policy", "shipping & logistics services",
+        "after-sales protections", "rising search trends", "trade assurance",
+        "on-time delivery", "product monitoring & inspection services", "logistics service",
+        "payment solution", "view more", "learn more", "shop now", "explore",
+        "alibaba.com selects", "source now", "send inquiry", "chat now", "contact supplier",
+        "get a quote", "supplier assessment"
+    ]
+
+    while scroll_count < total_scroll_limit:
+        scroll_count += 1
+        print(f"Processing product extraction pass {scroll_count} for category '{current_category_name}'...")
+        
+        product_containers_before_scroll = await page.query_selector_all(generic_product_container_selector_for_counting)
+        count_before_scroll = len(product_containers_before_scroll)
+        print(f"  Product container count before scroll action (pass {scroll_count}): {count_before_scroll}")
+        
+        current_body_scroll_height = await page.evaluate("document.body.scrollHeight")
+        
+        if scroll_count > 1: 
+            print("  Attempting to focus body and scroll using PageDown key presses...")
+            try:
+                await page.focus("body") 
+                print("  Successfully focused body.")
+            except Exception as e:
+                print(f"  Could not focus body, proceeding with scroll anyway: {e}")
+
+            for i in range(15): # Press PageDown 15 times
+                await page.keyboard.press("PageDown")
+                await page.wait_for_timeout(300) 
+                if (i + 1) % 5 == 0:
+                    print(f"    ... {i+1} PageDowns done")
+            await page.wait_for_timeout(1500) 
+            print("  Finished PageDown scroll attempts (on body).")
+        else: 
+             print(f"  Initial product extraction pass (scroll_count=1), using pre-loaded content (no scroll action).")
+
+
+        effective_wait_after_scroll_actions = scroll_delay + 2 
+        print(f"  Waiting for {effective_wait_after_scroll_actions} seconds for content to potentially load/settle...")
+        await page.wait_for_timeout(effective_wait_after_scroll_actions * 1000)
+
+        new_content_appeared_in_dom = False
+        if scroll_count > 1: 
+            print(f"  Checking if new product containers appeared in DOM (start count: {count_before_scroll}). Max wait 10s...")
+            try:
+                await page.wait_for_function(
+                    f"document.querySelectorAll('{generic_product_container_selector_for_counting}').length > {count_before_scroll}",
+                    timeout=10000 
+                )
+                new_total_container_count = len(await page.query_selector_all(generic_product_container_selector_for_counting))
+                print(f"  SUCCESS: Product container count increased to {new_total_container_count}.")
+                new_content_appeared_in_dom = True
+            except PlaywrightTimeoutError:
+                new_total_container_count = len(await page.query_selector_all(generic_product_container_selector_for_counting))
+                print(f"  TIMEOUT: Product container count did not increase. Current count: {new_total_container_count}.")
+            except Exception as e:
+                print(f"  Error during wait_for_function for product container count: {e}")
+        
+        # ----- START DEBUG CODE for state at scroll_count == 1 and 2, before extraction -----
+        if current_category_name == "All" and (scroll_count == 1 or scroll_count == 2): 
+            debug_category_name_slug = current_category_name.replace(" ", "_").replace("&", "and").replace("/", "_")
+            html_path = f"{debug_category_name_slug}_debug_for_pass_{scroll_count}.html"
+            screenshot_path = f"{debug_category_name_slug}_debug_for_pass_{scroll_count}.png"
+            
+            print(f"  DEBUG: Saving HTML for {current_category_name} (Pass {scroll_count}) to {html_path}")
+            html_content = await page.content()
+            with open(html_path, "w", encoding="utf-8") as f:
+                f.write(html_content)
+            
+            print(f"  DEBUG: Taking screenshot for {current_category_name} (Pass {scroll_count}) to {screenshot_path}")
+            await page.screenshot(path=screenshot_path, full_page=True)
+            print(f"  DEBUG: HTML and Screenshot saved for {current_category_name} (Pass {scroll_count}).")
+        # ----- END DEBUG CODE -----
+
+        print(f"  Extracting product information for category: {current_category_name} (Pass {scroll_count})...")
+        
+        product_elements_xpath = """
+        //a[
+            contains(@class, 'hugo4-product') and
+            .//img[contains(@class, 'picture-image') and (@src or @data-src)] and
+            (
+                .//div[contains(@class, 'price')]//text()[contains(., '$') or contains(., '€') or contains(., '£') or contains(., '¥')] or
+                .//div[contains(@class, 'moq')]//text()[contains(translate(., 'MINORDER', 'minorder'), 'min. order')]
+            )
+            and not(contains(@href, 'javascript:void(0)'))
+        ]
+        """
+        product_elements = await page.query_selector_all(product_elements_xpath)
+        print(f"  Found {len(product_elements)} elements matching specific product XPath for extraction.")
+
+        current_products_on_page_this_pass = []
+        for i, el in enumerate(product_elements): 
+            product_data = {
+                "name": None, "product_url": None, "image_url": None, "price": None,
+                "alibaba_category": current_category_name
+            }
+            try:
+                raw_product_url = await el.get_attribute("href")
+                if raw_product_url:
+                    parsed_url = urlparse(raw_product_url)
+                    if parsed_url.scheme and parsed_url.netloc:
+                        product_data["product_url"] = raw_product_url
+                    elif raw_product_url.startswith("//"):
+                        product_data["product_url"] = "https:" + raw_product_url
+                    elif raw_product_url.startswith("/"):
+                        current_page_url_parts = urlparse(page.url)
+                        product_data["product_url"] = f"{current_page_url_parts.scheme}://{current_page_url_parts.netloc}{raw_product_url}"
+                    else: 
+                        if "http" in raw_product_url: 
+                           product_data["product_url"] = raw_product_url
+                        else:
+                           continue 
+                else:
+                    continue
+                
+                if product_data["product_url"] and ("javascript:void(0)" in product_data["product_url"] or \
+                   not re.search(r"/product-detail/|/p-detail/|item_detail\.htm", product_data["product_url"], re.IGNORECASE) and \
+                   not re.search(r"productgrouphome\.html", product_data["product_url"], re.IGNORECASE) and \
+                   not ".html" in product_data["product_url"] 
+                   ): 
+                    is_likely_service_or_promo_url = False
+                    promo_keywords_in_url = ['promotion', 'campaign', 'service', 'solution', 'about', 'contact', 'policy', 'news', 'blog', 'category', 'search']
+                    for kw in promo_keywords_in_url:
+                        if kw in product_data["product_url"].lower():
+                            is_likely_service_or_promo_url = True
+                            break
+                    if is_likely_service_or_promo_url and not ".html" in product_data["product_url"]: 
+                        continue
+
+                img_el_candidate = await el.query_selector("img.picture-image")
+                if img_el_candidate:
+                    img_src = await img_el_candidate.get_attribute("src") or await img_el_candidate.get_attribute("data-src")
+                    if img_src:
+                        if img_src.startswith("//"):
+                            product_data["image_url"] = "https:" + img_src
+                        elif img_src.startswith("/"):
+                            current_page_url_parts = urlparse(page.url)
+                            product_data["image_url"] = f"{current_page_url_parts.scheme}://{current_page_url_parts.netloc}{img_src}"
+                        elif img_src.startswith("http"):
+                            product_data["image_url"] = img_src
+                
+                name_text_content = None
+                name_el_candidate = await el.query_selector("div.hugo4-product-element.subject span")
+                if name_el_candidate:
+                    name_text_content = await name_el_candidate.get_attribute("title")
+                    if not name_text_content or len(name_text_content.strip()) < 5:
+                        name_text_content = await name_el_candidate.text_content()
+                
+                if not name_text_content or len(name_text_content.strip()) <=5: 
+                    name_text_content = await el.text_content()
+
+                if name_text_content:
+                    cleaned_name = name_text_content.strip()
+                    cleaned_name = re.sub(r'Min\.\s*order:.*', '', cleaned_name, flags=re.IGNORECASE | re.DOTALL).strip()
+                    cleaned_name = re.sub(r'\$\s?[\d,.]+\s*(-\s*\$\s?[\d,.]+)?(/\s*\w+)?', '', cleaned_name).strip()
+                    cleaned_name = re.sub(r'\d+\s*pieces.*', '', cleaned_name, flags=re.IGNORECASE | re.DOTALL).strip()
+                    cleaned_name = re.sub(r'(Ready to Ship|In stock|Listed in last \d+ days)', '', cleaned_name, flags=re.IGNORECASE).strip()
+                    cleaned_name = re.sub(r'\s{2,}', ' ', cleaned_name).strip() 
+                    
+                    if any(non_prod_title == cleaned_name.lower() for non_prod_title in NON_PRODUCT_TITLES):
+                        cleaned_name = None
+                    elif len(cleaned_name) < 10 or len(cleaned_name) > 300: 
+                        cleaned_name = None
+                    elif "alibaba.com" in cleaned_name.lower() and len(cleaned_name.split()) < 5 : 
+                        cleaned_name = None
+                    product_data["name"] = cleaned_name
+                
+                price_text_found = None
+                price_el_candidate = await el.query_selector("div.hugo4-product-price-area div.hugo3-util-ellipsis")
+                if price_el_candidate:
+                    price_text_found = await price_el_candidate.text_content()
+                
+                if price_text_found and re.search(r"\d", price_text_found):
+                    match = re.search(r"([$€£¥]?\s?[\d,]+(\.\d{1,2})?)", price_text_found) 
+                    if match: product_data["price"] = match.group(1).strip()
+                    else: product_data["price"] = None 
+                else: 
+                    full_text_for_price = await el.text_content()
+                    if full_text_for_price:
+                        match = re.search(r"([$€£¥]?\s?[\d,]+(\.\d{1,2})?(\s*-\s*[$€£¥]?\s?[\d,]+(\.\d{1,2})?)?)", full_text_for_price) 
+                        if match and re.search(r"\d", match.group(1)): product_data["price"] = match.group(1).strip()
+
+                if product_data["name"] and product_data["product_url"] and product_data["image_url"] and product_data["price"]:
+                    is_duplicate = any(
+                        p_existing["product_url"] == product_data["product_url"] for p_existing in products_in_category + current_products_on_page_this_pass
+                    )
+                    if not is_duplicate:
+                         current_products_on_page_this_pass.append(product_data)
+            except Exception as e:
+                # print(f"  Error processing a product element: {e}") 
+                continue 
+        
+        newly_added_count = 0
+        for p_new in current_products_on_page_this_pass:
+            is_duplicate_overall = any(p_existing["product_url"] == p_new["product_url"] for p_existing in products_in_category)
+            if not is_duplicate_overall:
+                products_in_category.append(p_new)
+                newly_added_count +=1
+                print(f"Scraped product {len(products_in_category)}/'{max_products_per_category if max_products_per_category else 'all'}' for '{current_category_name}': Name='{p_new['name'][:30]}...' Price='{p_new['price']}'")
+        
+        if max_products_per_category and len(products_in_category) >= max_products_per_category:
+            print(f"Reached max_products_per_category limit of {max_products_per_category} for '{current_category_name}'.")
+            break
+        
+        new_body_scroll_height_after_extraction = await page.evaluate("document.body.scrollHeight")
+        if newly_added_count == 0:
+            if scroll_count > 1 and not new_content_appeared_in_dom and new_body_scroll_height_after_extraction == current_body_scroll_height:
+                scroll_attempts_no_new_content += 1
+                print(f"  No new unique products scraped, no new product DOM elements detected, AND page height unchanged. Attempt {scroll_attempts_no_new_content}/{max_scroll_attempts_no_new_content}.")
+            elif scroll_count == 1 and len(product_elements) == 0 : 
+                 scroll_attempts_no_new_content += 1 
+                 print(f"  No products found on initial load (pass 1). Attempt {scroll_attempts_no_new_content}/{max_scroll_attempts_no_new_content}.")
+            elif scroll_count > 1 and new_content_appeared_in_dom : 
+                print(f"  New product containers appeared in DOM, but no new *valid* products were extracted by current XPaths/filters. Resetting no_new_content counter to give XPaths a chance on more scrolled content.")
+                scroll_attempts_no_new_content = 0 
+            else: 
+                scroll_attempts_no_new_content += 1
+                print(f"  No new unique products scraped. Page height change: {new_body_scroll_height_after_extraction != current_body_scroll_height}. New DOM elements: {new_content_appeared_in_dom}. Attempt {scroll_attempts_no_new_content}/{max_scroll_attempts_no_new_content}.")
+
+
+            if scroll_attempts_no_new_content >= max_scroll_attempts_no_new_content:
+                print(f"Reached end of products for category '{current_category_name}' after {scroll_attempts_no_new_content} scrolls with no new valid content or DOM/page changes.")
+                break
+        else: 
+            scroll_attempts_no_new_content = 0 
+            print(f"  Successfully added {newly_added_count} new products this pass.")
+
+        if scroll_count >= total_scroll_limit:
+            print(f"Reached total scroll limit of {total_scroll_limit} for category '{current_category_name}'.")
+            break
+            
+    print(f"Finished scraping for category: {current_category_name}. Found {len(products_in_category)} products.")
+    return products_in_category
+
+async def scrape_alibaba_new_arrivals(url, max_products_per_category=None, scroll_delay=5, max_scroll_no_new=3):
+    all_products = []
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True) 
+        
+        # Define a common desktop user agent
+        user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/102.0.5005.63 Safari/537.36"
+        
+        context = await browser.new_context(
+            user_agent=user_agent,
+            viewport={'width': 1920, 'height': 1080}, 
+            # locale="en-US" # Optionally set locale if region-specific content is suspected
+        )
+        page = await context.new_page()
+        
+        page.set_default_navigation_timeout(90000) 
+        page.set_default_timeout(60000)
+
+        try:
+            print(f"Navigating to {url} with user-agent and viewport set...")
+            await page.goto(url, wait_until="domcontentloaded") 
+            print("Page loaded. Waiting for initial dynamic content and category tabs...")
+            await page.wait_for_timeout(12000) # Slightly increased initial wait
+            
+            await handle_modal_dialogs(page)
+
+            category_tab_selector = "div.hugo-dotelement.tab-item" 
+            initial_category_tabs_elements = await page.query_selector_all(category_tab_selector)
+            
+            if not initial_category_tabs_elements:
+                print("No category tabs found using selector. Trying a more general approach for tabs...")
+                potential_tab_selectors = [
+                    "div[role='tab']", 
+                    "li[role='tab']", 
+                    "div[class*='tab-item']", 
+                    "div[class*='category-tab']"
+                ]
+                for sel in potential_tab_selectors:
+                    initial_category_tabs_elements = await page.query_selector_all(sel)
+                    if initial_category_tabs_elements:
+                        temp_tabs = []
+                        for tab_el in initial_category_tabs_elements:
+                            text_content = await tab_el.text_content()
+                            if text_content and len(text_content.strip()) > 1:
+                                bounding_box = await tab_el.bounding_box()
+                                if bounding_box and bounding_box['width'] > 10 and bounding_box['height'] > 5 : 
+                                    temp_tabs.append(tab_el)
+                        initial_category_tabs_elements = temp_tabs
+                        if initial_category_tabs_elements:
+                            print(f"Found {len(initial_category_tabs_elements)} potential tabs with selector: {sel}")
+                            category_tab_selector = sel 
+                            break
+            
+            if not initial_category_tabs_elements:
+                print("Still no category tabs found. Scraping current view as 'Default' category.")
+                products_from_default = await scrape_products_from_current_page(page, scroll_delay, max_products_per_category, "Default", max_scroll_no_new)
+                all_products.extend(products_from_default)
+            else:
+                print(f"Found {len(initial_category_tabs_elements)} category tabs initially using selector '{category_tab_selector}'.")
+                category_names_and_indices = []
+                for i, tab_element in enumerate(initial_category_tabs_elements):
+                    try:
+                        name_element = await tab_element.query_selector(".text") 
+                        cat_name = ""
+                        if name_element:
+                            cat_name = (await name_element.text_content() or "").strip()
+                        
+                        if not cat_name: 
+                           cat_name = (await tab_element.text_content() or "").strip()
+                        
+                        cat_name = re.sub(r"^\d+\s*-\s*", "", cat_name).strip() 
+
+                        if cat_name: 
+                            category_names_and_indices.append({"name": cat_name, "original_index": i})
+                            print(f"Identified category tab: '{cat_name}' (Index: {i})")
+                        else:
+                            print(f"Warning: Tab at index {i} has no discernible text name. Skipping.")
+                    except Exception as e:
+                        print(f"Error getting name for tab {i}: {e}")
+
+                if not category_names_and_indices: 
+                     print("No valid category names extracted from tabs. Scraping current view as 'Default'.")
+                     products_from_default = await scrape_products_from_current_page(page, scroll_delay, max_products_per_category, "Default", max_scroll_no_new)
+                     all_products.extend(products_from_default)
+                else:
+                    first_category_processed = False 
+                    for cat_info in category_names_and_indices:
+                        current_category_name = cat_info["name"]
+                        original_tab_index = cat_info["original_index"]
+                        print(f"\nProcessing category: '{current_category_name}' (Original Tab Index: {original_tab_index})...")
+                        
+                        await handle_modal_dialogs(page) 
+
+                        current_tabs_on_page = await page.query_selector_all(category_tab_selector) 
+                        if original_tab_index >= len(current_tabs_on_page):
+                            print(f"Tab for '{current_category_name}' (index {original_tab_index}) not found after potential DOM change or re-query. Expected {len(current_tabs_on_page)} tabs. Skipping.")
+                            continue
+                        
+                        tab_to_click = current_tabs_on_page[original_tab_index]
+                        try:
+                            await tab_to_click.scroll_into_view_if_needed(timeout=10000)
+                            await page.wait_for_timeout(1000) 
+                            
+                            is_selected = "item-selected" in (await tab_to_click.get_attribute("class") or "") or \
+                                          "active" in (await tab_to_click.get_attribute("class") or "") or \
+                                          await tab_to_click.evaluate("node => node.getAttribute('aria-selected') === 'true'")
+
+                            action_taken = False 
+                            if not (original_tab_index == 0 and not first_category_processed and is_selected):
+                                print(f"Attempting to click tab: '{current_category_name}'")
+                                await tab_to_click.click(timeout=20000, force=True) 
+                                print(f"Clicked '{current_category_name}'. Waiting for content to load...")
+                                action_taken = True
+                            else:
+                                print(f"Tab '{current_category_name}' appears to be already selected (or is first tab). Proceeding to scrape.")
+                            
+                            first_category_processed = True 
+
+                            if action_taken:
+                                print("Waiting for network idle after tab click...")
+                                await page.wait_for_load_state('networkidle', timeout=30000) 
+                                await page.wait_for_timeout(8000) 
+                            else:
+                                print("Tab was pre-selected. Performing a shorter wait for content readiness...")
+                                await page.wait_for_timeout(5000) 
+
+                        except PlaywrightTimeoutError as te:
+                            print(f"Timeout error during tab interaction or loading for '{current_category_name}': {te}. Attempting to reload and retry modal handling.")
+                            try:
+                                await page.reload(wait_until="domcontentloaded", timeout=60000)
+                                await page.wait_for_timeout(8000)
+                                await handle_modal_dialogs(page) 
+                            except Exception as rle:
+                                print(f"Error during reload/modal handling after tab click timeout for '{current_category_name}': {rle}")
+                            print(f"Skipping category '{current_category_name}' due to persistent click/load issues.")
+                            continue 
+                        except Exception as e:
+                            print(f"Non-timeout error during tab interaction for '{current_category_name}': {e}. Skipping category.")
+                            continue 
+
+                        products_from_category = await scrape_products_from_current_page(page, scroll_delay, max_products_per_category, current_category_name, max_scroll_no_new)
+                        all_products.extend(products_from_category)
+                        print(f"Total products scraped so far: {len(all_products)}")
+        
+        except PlaywrightTimeoutError as pte:
+            print(f"A major Playwright timeout occurred during setup or navigation: {pte}")
+        except Exception as e:
+            print(f"An critical error occurred during the overall scraping process: {e}")
+        
+        finally:
+            if 'browser' in locals() and browser.is_connected(): 
+                await browser.close()
+            print(f"Browser closed. Total products scraped across all categories: {len(all_products)}")
+    
+    return all_products
+
+async def main():
+    target_url = "https://sale.alibaba.com/p/db971rh77/index.html" 
+    print(f"Starting multi-category scraper with infinite scroll for {target_url}")
+    
+    scraped_data = await scrape_alibaba_new_arrivals(
+        url=target_url, 
+        max_products_per_category=None, 
+        scroll_delay=7, 
+        max_scroll_no_new=10 
+    )
+    
+    if scraped_data:
+        print(f"\nSuccessfully scraped {len(scraped_data)} products in total.")
+        output_file = "scraped_alibaba_new_arrivals_fixed.json" 
+        try:
+            with open(output_file, "w", encoding="utf-8") as f:
+                json.dump(scraped_data, f, indent=2, ensure_ascii=False)
+            print(f"Scraped data saved to {output_file}")
+            
+            print(f"\n--- Summary of first 5 products (if available) ---")
+            for i, product in enumerate(scraped_data[:5]):
+                print(f"--- Product {i+1} (Category: {product.get('alibaba_category')}) ---")
+                print(f"  Name: {product.get('name')}")
+                print(f"  URL: {product.get('product_url')}")
+                print(f"  Price: {product.get('price')}")
+                print(f"  Image: {product.get('image_url')}")
+                print("---------------------")
+        except Exception as e:
+            print(f"Error writing to JSON file: {e}")
+    else:
+        print("No products were scraped, or an error occurred before product processing could complete.")
+
+if __name__ == "__main__":
+    asyncio.run(main())
